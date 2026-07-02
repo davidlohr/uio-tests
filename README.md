@@ -85,7 +85,7 @@ a 4G CFMWS window with `back-invalidate=on`, two cxl-type3 devices with
 `x-256b-flit`. Device knobs: `x-uio` (completer), `x-uio-req`
 (requester), `x-ats`.
 
-### t2 — switch happy path (29 checks + 4 hot-remove)
+### t2 — switch happy path (43 checks + 4 hot-remove)
 
     rp0 -- us0 -- dsp0 -- mem0 (region target)
                 \- dsp1 -- mem1 (requester)     all knobs on
@@ -117,9 +117,17 @@ What it proves, in order:
    `valid` flips 1→0, quiesce/revoke ops fire exactly once each.
 8. 2-way interleaved uio region under the switch: route binds to
    **both** targets (`nr_targets: 2`) — all-or-none structurally.
-9. Phase 2 (host-driven): `device_del mem0` → orderly pciehp removal
-   → route revoked, ops fired once (delta-counted against a baseline),
-   requester DevCtl3 enable cleared.
+9. Subrange decode (1 vs 2 interleave granules → 1 vs 2 bound
+   targets), PREFERRED-on-eligible takes the UIO plan, post-commit
+   `uio`/`uio_policy` EBUSY guards, and the dma-debug misuse triad
+   (RAM / no-route / attr-mismatch warnings via the module's
+   `misuse` hook, needs CONFIG_DMA_API_DEBUG).
+10. Requester FLR: the reset-preparation revocation entry point
+    (self-contained on a requester-only device), route revoked and
+    DevCtl3 enable cleared.
+11. Phase 2 (host-driven): `device_del mem0` → orderly pciehp removal
+    → route revoked, ops fired once (delta-counted against a
+    baseline), requester DevCtl3 enable cleared.
 
 ### t5 — device without UIO capability (2 checks)
 
@@ -142,6 +150,19 @@ DSP). No uio region may reach committed state; in practice the BI
 prerequisite (also flit-gated) rejects the region at target attach
 before the UIO segment check runs — both gates lead to the same
 fail-closed outcome and the test accepts either shape.
+
+### t6 — 4-way interleave (6 checks)
+
+Four endpoints under one switch, 4-way `uio=1` region. Exercises
+per-endpoint ISP programming, `pos_map` for more than two interleave
+positions, a 5-hop route (4 DSPs + USP), and subrange decode
+(1-granule → 1 target, 3-granule → 3 targets).
+
+### t7 — requester without ATS (3 checks)
+
+Requesters realized without `x-ats`. CXL HDM decoders match
+translated addresses only, so REQUIRED route acquisition is refused
+(`-95`) and PREFERRED falls back to the ordered host-mediated plan.
 
 ### t8 — cross root port (4 checks)
 
