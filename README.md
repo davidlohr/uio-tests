@@ -93,8 +93,11 @@ a 4G CFMWS window with `back-invalidate=on`, two cxl-type3 devices with
 What it proves, in order:
 
 1. Discovery: `/sys/kernel/debug/pci_uio/capabilities` shows exactly
-   5 `routing` ports (incl. a plain pcie-root-port with SVC — the
-   regression check for the SVC-vs-AER placement fix) and 2
+   7 SVC-capable functions — 5 ports (incl. a plain pcie-root-port
+   with SVC, the regression check for the SVC-vs-AER placement fix)
+   plus the 2 endpoints, which carry SVC themselves (VC enablement
+   is per-link, both partners; TC3 mapping lives in the port
+   containing the requester/completer function) — and 2
    `requester completer` endpoints (Device 3 capability emulation).
 2. `uio=1` region commit succeeds; endpoint decoder `uio` attr reads 1.
 3. REQUIRED route via the `cxl_uio_test` consumer: `rc: 0`,

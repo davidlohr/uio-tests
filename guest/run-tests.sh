@@ -96,8 +96,11 @@ case $SUITE in
 t2)	# happy path: switch topology, both endpoints uio+req+ats capable
 	# --- test 1: capability discovery
 	caps=$(cat $DBG/pci_uio/capabilities)
-	expect_eq "five routing-capable ports" \
-		"$(echo "$caps" | grep -c routing)" 5
+	# 5 ports + 2 endpoints: endpoints carry SVC too (both Link
+	# partners must enable the UIO VC, and TC3 mapping lives in the
+	# port containing the requester/completer Function).
+	expect_eq "seven SVC/UIO-VC capable functions" \
+		"$(echo "$caps" | grep -c routing)" 7
 	expect_eq "two requester+completer endpoints" \
 		"$(echo "$caps" | grep -c 'requester completer')" 2
 
