@@ -151,8 +151,47 @@ t2)	# happy path: switch topology, both endpoints uio+req+ats capable
 		ok "no dma-debug coverage warning for valid mapping"
 	fi
 
-	# --- release, then FORBIDDEN policy => ordered plan, no route
 	echo 1 > $CUT/release
+
+	# --- test 9b: dma-debug misuse triad (RAM + no-route + mismatch)
+	if [ -d $DBG/dma-api ]; then
+		echo 1 > $DBG/dma-api/all_errors 2>/dev/null
+		echo 1 > $CUT/misuse
+		check "dma-debug flags UIO on cacheable RAM" \
+			sh -c "dmesg | grep -q 'DMA_ATTR_UIO mapping of cacheable system RAM'"
+		check "dma-debug flags UIO without covering route" \
+			sh -c "dmesg | grep -q 'DMA_ATTR_UIO mapping without a covering'"
+		check "dma-debug flags map/unmap attr mismatch" \
+			sh -c "dmesg | grep -q 'different attributes'"
+	else
+		ok "dma-api debugfs absent (skip misuse triad)"
+		ok "skip"; ok "skip"
+	fi
+
+	# --- test: PREFERRED on an eligible region takes the UIO plan
+	cut_set policy preferred
+	echo 1 > $CUT/acquire
+	expect_eq "PREFERRED uses UIO when eligible" \
+		"$(cut_field rc)/$(cut_field xport_uio)" "0/1"
+	echo 1 > $CUT/release
+
+	# --- post-commit provisioning guards (EBUSY) + attrs
+	expect_eq "root decoder cap_uio" \
+		"$(cat $CXL/$(root_decoder)/cap_uio)" 1
+	expect_eq "uio_policy default" \
+		"$(cat $CXL/$region/uio_policy)" required
+	if echo 0 > $CXL/$region/uio 2>/dev/null; then
+		fail "uio store rejected after commit"
+	else
+		ok "uio store rejected after commit"
+	fi
+	if echo -n forbidden > $CXL/$region/uio_policy 2>/dev/null; then
+		fail "uio_policy store rejected after commit"
+	else
+		ok "uio_policy store rejected after commit"
+	fi
+
+	# --- FORBIDDEN policy => ordered plan, no route
 	cut_set policy forbidden
 	echo 1 > $CUT/acquire
 	expect_eq "FORBIDDEN acquires without route" "$(cut_field rc)" 0
@@ -202,6 +241,45 @@ t2)	# happy path: switch topology, both endpoints uio+req+ats capable
 	# target set structurally all-or-none.
 	expect_eq "2-way route acquired" "$(cut_field rc)" 0
 	expect_eq "2-way: two targets" "$(cut_field nr_targets)" 2
+	echo 1 > $CUT/release
+
+	# subrange decode: one 256B granule touches position 0 only;
+	# two granules touch both (cxl_region_p2p_validate pos_map math)
+	cut_set len 0x100
+	echo 1 > $CUT/acquire
+	expect_eq "subrange (1 granule) binds one target" \
+		"$(cut_field rc)/$(cut_field nr_targets)" "0/1"
+	echo 1 > $CUT/release
+	cut_set len 0x200
+	echo 1 > $CUT/acquire
+	expect_eq "subrange (2 granules) binds both targets" \
+		"$(cut_field rc)/$(cut_field nr_targets)" "0/2"
+	echo 1 > $CUT/release
+	cut_set len 0
+	destroy_region "$region"
+
+	# --- FLR on the requester: reset-preparation revocation path.
+	# Self-contained: a 1-way region on mem0 with mem1 as a
+	# requester-only (never a target), so FLR of mem1 does not
+	# disturb any committed target decoder.
+	region=$(create_region 1 1 mem0)
+	commit_region "$region"
+	cut_set requester "$req_bdf"
+	cut_set region "$region"
+	cut_set policy required
+	echo 1 > $CUT/acquire
+	expect_eq "route for FLR test" "$(cut_field rc)" 0
+	base_q=$(awk '$1=="quiesce:" {print $2}' $CUT/events)
+	base_r=$(awk '$1=="revoke:" {print $2}' $CUT/events)
+	echo 1 > /sys/bus/pci/devices/$req_bdf/reset
+	expect_eq "route revoked by requester FLR" "$(cut_get valid)" 0
+	now_q=$(awk '$1=="quiesce:" {print $2}' $CUT/events)
+	now_r=$(awk '$1=="revoke:" {print $2}' $CUT/events)
+	expect_eq "quiesce+revoke fired once on FLR" \
+		"$now_q/$now_r" "$((base_q+1))/$((base_r+1))"
+	dev3=$(setpci -s "$req_bdf" ECAP002f+8.L)
+	expect_eq "requester enable gone after FLR" \
+		"$((0x$dev3 & 0x80))" 0
 	echo 1 > $CUT/release
 	destroy_region "$region"
 
@@ -283,6 +361,55 @@ t8)	# targets under different root ports. The host bridge (pxb)
 	[ "$mt" = 2 ] || [ "$mt" = 4 ] && mt=ok
 	expect_eq "PREFERRED ordered fallback cross-RP" \
 		"$(cut_field rc)/$(cut_field xport_uio)/$mt" "0/0/ok"
+	echo 1 > $CUT/release
+	destroy_region "$region"
+	;;
+t6)	# 4-way interleave under one switch: per-endpoint ISP, pos_map
+	# for >2 positions, multi-target route with hop dedup.
+	region=$(create_region 1 4 $(mem_for_bdf 0000:0f:00.0) \
+		$(mem_for_bdf 0000:10:00.0) $(mem_for_bdf 0000:11:00.0) \
+		$(mem_for_bdf 0000:12:00.0))
+	check "4-way uio region commit" commit_region "$region"
+	cut_set requester "$(bdf_for_mem "$(mem_for_bdf 0000:12:00.0)")"
+	cut_set region "$region"
+	cut_set policy required
+	cut_set offset 0; cut_set len 0
+	echo 1 > $CUT/acquire
+	expect_eq "4-way route acquired" "$(cut_field rc)" 0
+	expect_eq "4-way: four targets" "$(cut_field nr_targets)" 4
+	expect_eq "4-way: five hops (4 DSPs + USP)" \
+		"$(cut_field nr_hops)" 5
+	echo 1 > $CUT/release
+	cut_set len 0x100
+	echo 1 > $CUT/acquire
+	expect_eq "4-way subrange binds one target" \
+		"$(cut_field rc)/$(cut_field nr_targets)" "0/1"
+	echo 1 > $CUT/release
+	cut_set len 0x300
+	echo 1 > $CUT/acquire
+	expect_eq "4-way 3-granule subrange binds three targets" \
+		"$(cut_field rc)/$(cut_field nr_targets)" "0/3"
+	echo 1 > $CUT/release
+	cut_set len 0
+	destroy_region "$region"
+	;;
+
+t7)	# requester without ATS: HDM decoders match translated
+	# addresses only, so the route must be refused; PREFERRED
+	# falls back to the ordered host-mediated plan.
+	region=$(create_region 1 1 "$(mem_for_bdf 0000:0f:00.0)")
+	check "uio region commit (no-ATS topo)" commit_region "$region"
+	cut_set requester "$(bdf_for_mem "$(mem_for_bdf 0000:10:00.0)")"
+	cut_set region "$region"
+	cut_set policy required
+	echo 1 > $CUT/acquire
+	expect_eq "REQUIRED fails without requester ATS" \
+		"$(cut_field rc)" -95
+	cut_set policy preferred
+	echo 1 > $CUT/acquire
+	expect_eq "PREFERRED ordered fallback without ATS" \
+		"$(cut_field rc)/$(cut_field xport_uio)/$(cut_field map_type)" \
+		"0/0/4"
 	echo 1 > $CUT/release
 	destroy_region "$region"
 	;;

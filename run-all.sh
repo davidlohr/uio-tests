@@ -55,6 +55,8 @@ run_suite "$UIO_TESTS_DIR/topos/t2-switch.sh"     t2
 run_suite "$UIO_TESTS_DIR/topos/t5-nouio-dev.sh"  t5
 run_suite "$UIO_TESTS_DIR/topos/t4-nosvc.sh"      t4
 run_suite "$UIO_TESTS_DIR/topos/t3-noflit.sh"     t3
+run_suite "$UIO_TESTS_DIR/topos/t6-x4.sh"         t6
+run_suite "$UIO_TESTS_DIR/topos/t7-noats.sh"      t7
 run_suite "$UIO_TESTS_DIR/topos/t8-crossrp.sh"    t8
 
 echo "==================================================="
