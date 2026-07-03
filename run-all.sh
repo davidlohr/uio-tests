@@ -53,6 +53,7 @@ run_suite() { # run_suite <topo-script> <suite>
 
 # suite -> topology script
 declare -A TOPO=(
+	[t1]=t1-direct.sh
 	[t2]=t2-switch.sh
 	[t3]=t3-noflit.sh
 	[t4]=t4-nosvc.sh
@@ -62,7 +63,7 @@ declare -A TOPO=(
 	[t8]=t8-crossrp.sh
 )
 # Default order runs the happy path first, then the fail-closed gates.
-ORDER="t2 t5 t4 t3 t6 t7 t8"
+ORDER="t1 t2 t5 t4 t3 t6 t7 t8"
 
 # No args: run everything. Otherwise run only the named suites, e.g.
 #   ./run-all.sh t2          # one suite (incl. its phase-2 hot-remove)

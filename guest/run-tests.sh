@@ -93,6 +93,45 @@ modprobe cxl_uio_test 2>/dev/null
 
 # =====================================================================
 case $SUITE in
+t1)	# minimal: one root port, one type3 directly under it, no switch.
+	# The only successful-commit topology where the root port is the
+	# sole upstream hop - t2/t6 target under a switch, and t8's direct
+	# commit deliberately fails on a non-UIO host bridge.
+	caps=$(cat $DBG/pci_uio/capabilities)
+	expect_eq "two SVC/UIO-VC capable functions (RP + endpoint)" \
+		"$(echo "$caps" | grep -c routing)" 2
+	expect_eq "one requester+completer endpoint" \
+		"$(echo "$caps" | grep -c 'requester completer')" 1
+
+	rd=$(root_decoder)
+	expect_eq "root decoder UIO-eligible (cap_uio)" \
+		"$(cat $CXL/$rd/cap_uio)" 1
+
+	# the single memdev, found generically (no BDF pinning needed)
+	mem=$(basename "$(ls -d $CXL/mem* | head -1)")
+	region=$(create_region 1 1 "$mem")
+	check "direct-attach uio region commit (RP-only uplink)" \
+		commit_region "$region"
+	dec=$(ep_decoder_for_mem "$mem")
+	expect_eq "endpoint decoder uio attr" "$(cat $CXL/$dec/uio)" 1
+
+	# A route over the direct (no-switch) path classifies THRU_RP,
+	# contrasting t2's in-fabric BUS_ADDR (flags 0x1). In this minimal
+	# topology the one device is both requester and target; the point
+	# under test is the path classification with the RP as sole hop.
+	cut_set requester "$(bdf_for_mem "$mem")"
+	cut_set region "$region"; cut_set policy required
+	cut_set offset 0; cut_set len 0
+	echo 1 > $CUT/acquire
+	expect_eq "direct route: UIO transport, thru-RP not in-fabric" \
+		"$(cut_field rc)/$(cut_field xport_uio)/$(cut_field route_flags)" \
+		"0/1/0x2"
+	expect_eq "direct route: single hop (the RP), host-mediated plan" \
+		"$(cut_field nr_hops)/$(cut_field map_type)" "1/4"
+	echo 1 > $CUT/release
+	destroy_region "$region"
+	;;
+
 t2)	# happy path: switch topology, both endpoints uio+req+ats capable
 	# --- test 1: capability discovery
 	caps=$(cat $DBG/pci_uio/capabilities)

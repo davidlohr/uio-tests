@@ -8,9 +8,9 @@ fallback, and revocation.
 
 The harness boots a kernel built from the UIO patch series under an
 emulated CXL fabric, drives an in-guest test driver over ssh, and emits
-TAP. Seven topologies exercise the happy path plus the fail-closed
-gates (missing capability, no SVC, non-flit link, cross-root-port,
-no-ATS requester, wide interleave).
+TAP. Eight topologies exercise the happy path (direct-attach and
+switched) plus the fail-closed gates (missing capability, no SVC,
+non-flit link, cross-root-port, no-ATS requester, wide interleave).
 
 > **Scope.** QEMU emulates UIO **enumeration only** — there is no UIO
 > data path. The suite validates discovery, provisioning gates, routing
@@ -153,11 +153,12 @@ The defaults assume the author's layout, so export your paths:
 
     ./run-all.sh
 
-Boots the seven topologies sequentially (one QEMU at a time, ssh
+Boots the eight topologies sequentially (one QEMU at a time, ssh
 forwarded on `127.0.0.1:$SSHPORT`), pushes the guest driver, runs each
 suite, and collects TAP + dmesg under `$RUNDIR/results/`. Exit status
 is 0 iff every suite passes. A fully green run ends with:
 
+    === t1 (t1-direct.sh) ===       # pass 7 fail 0
     === t2 (t2-switch.sh) ===       # pass 43 fail 0
     --- t2 phase 2: completer hot-remove revocation ---
     ok - route armed for hot-remove
@@ -167,17 +168,18 @@ is 0 iff every suite passes. A fully green run ends with:
     === t5 ... t4 ... t3 ... t6 ... t7 ... t8 ===  all pass
     suites failed: 0
 
-Wall-clock is dominated by seven guest boots (~1 min each).
+Wall-clock is dominated by eight guest boots (~1 min each).
 
 ### Running one suite (or a subset)
 
 `run-all.sh` takes suite names — handy while iterating, since each suite
 is one guest boot:
 
-    ./run-all.sh t2          # just t2 (incl. its phase-2 hot-remove)
+    ./run-all.sh t1          # just t1
     ./run-all.sh t4 t8       # a subset, in the given order
 
-Valid names: `t2 t3 t4 t5 t6 t7 t8`. With no arguments it runs them all.
+Valid names: `t1 t2 t3 t4 t5 t6 t7 t8`. With no arguments it runs them
+all.
 This routes through the same machinery as a full run, so per-suite TAP +
 dmesg still land in `$OUT`, and t2 still gets its hot-remove phase. For
 poking at a live guest instead of a scripted pass, see "Running one
@@ -229,11 +231,31 @@ addresses only, so requesters must be ATS-capable).
 
 ## The suites
 
+The `tN` labels are stable identifiers; the run order is by role, not by
+number — the happy paths first (t1 direct-attach, then t2 switched),
+since the fail-closed negatives only mean anything once the same
+topology is shown to succeed, then t5, t4, t3, t6, t7, t8.
+
 All topologies share the base: q35 + `cxl=on`, one `pxb-cxl` host
 bridge, a 4G CFMWS window with `back-invalidate=on`, and `cxl-type3`
 devices with `hdm-db=on`. Port knobs: `x-uio-svc3`/`x-uio-svc4` (SVC
 capability), `x-256b-flit`. Device knobs: `x-uio` (completer),
 `x-uio-req` (requester), `x-ats`.
+
+### t1 — direct attach, no switch (7 checks)
+
+    rp0 -- mem0     one root port, one type3 directly under it
+
+The minimal topology and the only *successful* commit where the root
+port is the sole upstream hop (t2/t6 target under a switch; t8's direct
+commit fails on a non-UIO host bridge). Proves: discovery (RP +
+endpoint both SVC-capable), the window is UIO-eligible (`cap_uio`), a
+1-way `uio=1` region commits and programs the endpoint decoder UIO bit
+with the RP as the sole segment-check hop, and that a route over the
+no-switch path classifies **THRU_RP** (`route_flags 0x2`, `map_type 4`,
+one hop) — the correct contrast to t2's in-fabric BUS_ADDR. (Minimal
+topology: the one device is both requester and target; the assertion is
+about path classification, not a distinct peer.)
 
 ### t2 — switch happy path (43 checks + 4 hot-remove)
 
@@ -447,4 +469,4 @@ here is what to change:
     guest/run-tests.sh   in-guest TAP driver; takes the suite name
     guest/hotremove-*.sh guest halves of the t2 hot-remove phase (host
                          side is in run-all.sh: QMP device_del + poll)
-    run-all.sh           orchestrator over all seven suites
+    run-all.sh           orchestrator over all eight suites
