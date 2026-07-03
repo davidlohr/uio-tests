@@ -385,6 +385,22 @@ counters are cumulative per boot — diff them, don't expect absolutes.
 
 ## Debugging failures
 
+### Common first-run failures
+
+Almost every first-run problem is a mismatch between the harness and
+one of the three parts you built. Keyed to what you'll see:
+
+| symptom | cause | fix |
+|---|---|---|
+| `launch failed`, with QEMU printing `Property 'cxl-type3.x-uio' not found` (or similar) on stderr | QEMU lacks the UIO enumeration series | build/point `QEMU` at the right branch; verify with the `-device ...,help` checks in Setup step 1 |
+| `Bail out! cxl_uio_test debugfs missing` (guest booted, ssh worked) | kernel missing `CONFIG_CXL_UIO_TEST`, or the UIO/CXL options built as **modules** (`=m`) — the harness installs no modules | rebuild with the options `=y` (Setup step 2); confirm `/sys/kernel/debug/cxl_uio_test` exists in-guest |
+| `guest failed to come up`, `console.log` ends in a kernel panic / `Unable to mount root fs` | wrong root device | set `ROOTDEV` to your image's root partition |
+| `guest failed to come up`, `console.log` reaches a login prompt but ssh never connects | first NIC didn't DHCP as `enp0s2`, or your key isn't trusted | fix guest networking (Setup step 3); check `SSH_KEY`; never set `net.ifnames=0` |
+| `guest failed to come up (or stale boot)` immediately | reused a still-running guest from a prior launch | `rm $RUNDIR/boot_id`, or `stop_qemu` first |
+| discovery counts off (e.g. "seven SVC-capable functions" fails) | QEMU has the properties but an out-of-date fix (endpoint SVC, decoder-count, SVC/AER ordering) | rebuild QEMU at the current branch tip |
+
+### General
+
 - `$RUNDIR/results/<suite>.tap` and `<suite>.dmesg` per run;
   `t2-hotremove.tap`/`.dmesg` for phase 2.
 - `$RUNDIR/console.log` — full serial console of the last boot.
@@ -470,3 +486,21 @@ here is what to change:
     guest/hotremove-*.sh guest halves of the t2 hot-remove phase (host
                          side is in run-all.sh: QMP device_del + poll)
     run-all.sh           orchestrator over all eight suites
+
+## References
+
+The behaviours asserted here trace to primary-source spec text:
+
+- **PCIe Base 6.x** — §6.34 Unordered I/O; §7.9.29 Streamlined Virtual
+  Channel (SVC, ext cap 0x35); §7.7.9 Device 3 capability
+  (DevCap3/DevCtl3 UIO + 14-bit tag bits); §2.4.4.2 (64B UIO write
+  ordering/granularity).
+- **CXL r4.0** — §9.16 UIO Direct P2P to HDM (interleave rules, address
+  match, `UIO To HDM Enable`); Table 8-116 (HDM Decoder Capability, UIO
+  bit + decoder count); Table 8-123 (decoder control UIO/UIG/UIW/ISP);
+  Table 8-32 (Port Control `UIO To HDM Enable`).
+- The kernel patch series cover letter is the design rationale (route
+  object, VC ownership, revocation, the CXL provisioning gates) and
+  maps each suite to the invariant it checks.
+- QEMU enumeration base: the Samsung UIO RFC on linux-cxl
+  (`20260609105836.3702787-1-shrihari.s@samsung.com`).
