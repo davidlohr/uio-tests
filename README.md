@@ -169,6 +169,21 @@ is 0 iff every suite passes. A fully green run ends with:
 
 Wall-clock is dominated by seven guest boots (~1 min each).
 
+### Running one suite (or a subset)
+
+`run-all.sh` takes suite names — handy while iterating, since each suite
+is one guest boot:
+
+    ./run-all.sh t2          # just t2 (incl. its phase-2 hot-remove)
+    ./run-all.sh t4 t8       # a subset, in the given order
+
+Valid names: `t2 t3 t4 t5 t6 t7 t8`. With no arguments it runs them all.
+This routes through the same machinery as a full run, so per-suite TAP +
+dmesg still land in `$OUT`, and t2 still gets its hot-remove phase. For
+poking at a live guest instead of a scripted pass, see "Running one
+suite by hand" below; to reproduce a single *check*, drive the debugfs
+consumer directly ("Driving the test consumer manually").
+
 ---
 
 ## Configuration
@@ -311,15 +326,21 @@ P2P whitelisting/CPU, both accepted.
 
 ## Running one suite by hand
 
+For a scripted single-suite pass use `./run-all.sh <suite>` (above).
+The manual sequence below is for *interactive* work — it leaves the
+guest running so you can poke at it (it skips result collection and t2's
+phase-2 hot-remove):
+
     ./topos/t2-switch.sh                   # boots in background
     source topo-lib.sh
     wait_for_guest 150
     guest_scp guest/run-tests.sh root@localhost:/tmp/
     guest_ssh "bash /tmp/run-tests.sh t2"  # t2|t3|t4|t5|t6|t7|t8
+    # ... poke at the live guest here ...
     stop_qemu
 
-Interactive poking: after `wait_for_guest`, just `guest_ssh` around.
-QMP one-shots: `qmp_cmd '{"execute":"query-status"}'`.
+After `wait_for_guest`, just `guest_ssh` around. QMP one-shots:
+`qmp_cmd '{"execute":"query-status"}'`.
 
 ## Driving the test consumer manually
 

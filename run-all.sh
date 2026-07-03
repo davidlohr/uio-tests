@@ -51,13 +51,31 @@ run_suite() { # run_suite <topo-script> <suite>
 	stop_qemu
 }
 
-run_suite "$UIO_TESTS_DIR/topos/t2-switch.sh"     t2
-run_suite "$UIO_TESTS_DIR/topos/t5-nouio-dev.sh"  t5
-run_suite "$UIO_TESTS_DIR/topos/t4-nosvc.sh"      t4
-run_suite "$UIO_TESTS_DIR/topos/t3-noflit.sh"     t3
-run_suite "$UIO_TESTS_DIR/topos/t6-x4.sh"         t6
-run_suite "$UIO_TESTS_DIR/topos/t7-noats.sh"      t7
-run_suite "$UIO_TESTS_DIR/topos/t8-crossrp.sh"    t8
+# suite -> topology script
+declare -A TOPO=(
+	[t2]=t2-switch.sh
+	[t3]=t3-noflit.sh
+	[t4]=t4-nosvc.sh
+	[t5]=t5-nouio-dev.sh
+	[t6]=t6-x4.sh
+	[t7]=t7-noats.sh
+	[t8]=t8-crossrp.sh
+)
+# Default order runs the happy path first, then the fail-closed gates.
+ORDER="t2 t5 t4 t3 t6 t7 t8"
+
+# No args: run everything. Otherwise run only the named suites, e.g.
+#   ./run-all.sh t2          # one suite (incl. its phase-2 hot-remove)
+#   ./run-all.sh t4 t8       # a subset
+SUITES="${*:-$ORDER}"
+for s in $SUITES; do
+	topo=${TOPO[$s]}
+	if [ -z "$topo" ]; then
+		echo "unknown suite '$s' (choices: $ORDER)" >&2
+		exit 2
+	fi
+	run_suite "$UIO_TESTS_DIR/topos/$topo" "$s"
+done
 
 echo "==================================================="
 echo "suites failed: $TOTAL_FAIL (results in $OUT)"
