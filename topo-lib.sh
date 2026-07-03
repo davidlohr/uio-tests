@@ -5,9 +5,13 @@
 # Usage: source this file, then call launch_qemu with topology device args.
 #        Guest reachable via: guest_ssh <cmd>
 
+# Configuration (override by exporting before sourcing; see README).
 QEMU=${QEMU:-$HOME/code/qemu-upstream/build/qemu-system-x86_64}
 KERNEL=${KERNEL:-$HOME/code/linux-torvalds/arch/x86/boot/bzImage}
 IMG=${IMG:-$HOME/img/cxl-test.qcow2}
+ROOTDEV=${ROOTDEV:-/dev/sda1}	# guest root partition (match your image)
+SSH_KEY=${SSH_KEY:-}		# ssh identity file; empty = default/agent
+EXTRA_APPEND=${EXTRA_APPEND:-}	# extra kernel cmdline appended to BOOTARGS
 SSHPORT=${SSHPORT:-27110}
 RUNDIR=${RUNDIR:-/tmp/uio-tests}
 QMPSOCK=$RUNDIR/qmp-sock
@@ -18,11 +22,12 @@ mkdir -p "$RUNDIR"
 
 # NB: no net.ifnames=0 - the guest image's netplan matches enp0s2, so the
 # e1000 must stay at 00:02.0 (first -device) with predictable naming.
-BOOTARGS="root=/dev/sda1 console=ttyS0 serial selinux=0 audit=0 \
+BOOTARGS="root=$ROOTDEV console=ttyS0 serial selinux=0 audit=0 \
 ignore_loglevel rw memhp_default_state=online \
 cxl_acpi.dyndbg=+fplm cxl_pci.dyndbg=+fplm cxl_core.dyndbg=+fplm \
 cxl_mem.dyndbg=+fplm cxl_port.dyndbg=+fplm cxl_region.dyndbg=+fplm \
-dyndbg=\"file drivers/pci/uio.c +p; file drivers/pci/p2pdma.c +p\""
+dyndbg=\"file drivers/pci/uio.c +p; file drivers/pci/p2pdma.c +p\" \
+$EXTRA_APPEND"
 
 # launch_qemu <device args...>
 # Boots in background; console to $CONSOLE_LOG, qmp on $QMPSOCK.
@@ -67,13 +72,14 @@ stop_qemu() {
 
 guest_ssh() {
 	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-	    -o ConnectTimeout=5 -o LogLevel=ERROR -p "$SSHPORT" \
+	    -o ConnectTimeout=5 -o LogLevel=ERROR \
+	    ${SSH_KEY:+-i "$SSH_KEY"} -p "$SSHPORT" \
 	    root@localhost "$@"
 }
 
 guest_scp() {
 	scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-	    -o LogLevel=ERROR -P "$SSHPORT" "$@"
+	    -o LogLevel=ERROR ${SSH_KEY:+-i "$SSH_KEY"} -P "$SSHPORT" "$@"
 }
 
 # wait_for_guest [timeout_sec]
