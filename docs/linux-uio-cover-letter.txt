@@ -1,0 +1,638 @@
+Subject: [RFC PATCH 0/9] PCI/CXL: PCIe Unordered IO (UIO) transport support
+
+PCIe 6.x Unordered IO (Base spec sec 6.34, incorporated from the UIO
+ECN) removes fabric ordering guarantees from a class of memory
+requests: completions may arrive in any order and shape, and the
+*requester* enforces dependent ordering (data before flag/doorbell)
+by accounting UIO completions per Transaction ID. In exchange, flows
+no longer serialize behind the producer/consumer ordering rules,
+which is what makes multi-path fabrics and high-rate peer-to-peer
+into CXL HDM viable. CXL r4.0 sec 9.16 keys in-fabric Direct P2P to
+HDM (and G-FAM) to UIO specifically: switch forwarding of peer
+traffic into HDM ranges is a UIO decoder mechanism, not generic
+memory routing.
+
+The kernel's job here is deliberately narrow: discover, validate,
+route, and revoke UIO transport. It never orders, fences, or waits
+for UIO traffic - including on the DMA unmap path. Ordering remains
+requester hardware's problem; transport legality becomes the
+kernel's.
+
+The central design decision: UIO is a property of a (requester,
+path, target set, range) tuple, never of a single device, so the
+central object is a refcounted, revocable *route*, and every role
+enable in the fabric is owned exclusively by route lifetime. There
+is no "enable UIO" API, no sysfs enable knob: an enabled requester
+with no validated route invites TLPs the fabric cannot deliver
+(a misrouted UIO TLP is dropped with TLP Translation Egress
+Blocked, i.e. completion timeouts).
+
+Layering
+========
+
+  consumer (here: cxl_uio_test.ko; later: VFIO DMABUF, iommufd,
+            RDMA, NVMe, CXL accel drivers)
+     |
+     |  cxl_region_p2pdma_provider()     get typed peer memory
+     |  pci_p2pdma_map_info(range,pol)   transfer plan + route
+     |  p2pdma_map_attrs()               MMIO/UIO attr derivation
+     |  dma_map_phys()/dma_unmap_phys()  mapping (annotated)
+     |  pci_uio_route_put()              release transport
+     v
+  +--------------------------------------------------------------+
+  |  DMA mapping   DMA_ATTR_UIO: stateless annotation on the      |
+  |                phys entry points. dma-debug checks route      |
+  |                coverage, map/unmap attr match, RAM misuse.    |
+  +--------------------------------------------------------------+
+  |  P2PDMA        typed providers: PCI_BAR_MMIO | CXL_HDM        |
+  |                (type is data - base+offset stays universal;   |
+  |                it governs attrs + CPU access rules only).     |
+  |                pci_p2pdma_map_info() classifies a *subrange*  |
+  |                worst-case across its interleave target set.   |
+  +--------------------------------------------------------------+
+  |  PCI core      DevCap3/DevCtl3 + SVC (0x35) parse;            |
+  |                pci_uio_route_get/put/valid: all-or-nothing    |
+  |                path validation, VC programming, role          |
+  |                refcounts, revocation from remove/reset/AER.   |
+  +--------------------------------------------------------------+
+  |  CXL           cxl_hdm_uio_setup() target capability;         |
+  |                region uio provisioning gates + decoder        |
+  |                UIO/UIG/UIW programming; committed region as   |
+  |                typed provider with interleave target decode.  |
+  +--------------------------------------------------------------+
+
+End-to-end: route acquisition
+=============================
+
+Numbers in brackets are the enforcement points, detailed below.
+
+ consumer            p2pdma           pci/uio.c            cxl
+    |                   |                 |                  |
+    | provider = cxl_region_p2pdma_provider(region)          |
+    |<------- &cxlr->p2p_provider [CXL_HDM, UIO_COMPLETER] --|
+    |                   |                 |                  |
+    | pci_p2pdma_map_info(provider, dev, off, len,           |
+    |                     req{policy=REQUIRED}, &info)       |
+    |------------------>|                 |                  |
+    |                   | pci_uio_route_get(requester,       |
+    |                   |    provider, off, len, req)        |
+    |                   |---------------->|                  |
+    |                   |                 | [1] caps:        |
+    |                   |                 |  requester DevCap3.REQ
+    |                   |                 |  provider UIO_COMPLETER
+    |                   |                 | [2] range_validate()
+    |                   |                 |----------------->|
+    |                   |                 |  target set +    |
+    |                   |                 |  interleave gran |
+    |                   |                 |<-----------------|
+    |                   |                 | [3] per-target walk to
+    |                   |                 |  the lowest common
+    |                   |                 |  ancestor (LCA):
+    |                   |                 |   - flit mode per link
+    |                   |                 |   - SVC routing per hop
+    |                   |                 |   - ACS-free (BAR) or
+    |                   |                 |     ATS-capable req (HDM)
+    |                   |                 | [4] commit, leaf->req:
+    |                   |                 |   a. target endpoint VCs
+    |                   |                 |   b. UIO-to-HDM DVSEC
+    |                   |                 |      gate per DSP
+    |                   |                 |   c. SVC VC3 per hop
+    |                   |                 |   d. requester's own VC
+    |                   |                 |   e. DevCtl3.REQ_EN
+    |                   |                 |  (unwind in reverse on
+    |                   |                 |   any failure)
+    |                   |                 | [5] limits from path
+    |                   |                 |  minimum (MPS, gran)
+    |                   |<-- route (ref) -|                  |
+    |<- info{type=BUS_ADDR, XPORT_UIO, uio_route}            |
+    |                   |                 |                  |
+    | attrs = p2pdma_map_attrs(&info, provider)              |
+    |   -> DMA_ATTR_UIO, and *not* DMA_ATTR_MMIO: HDM may be |
+    |      host-cacheable; MMIO is a BAR property, never     |
+    |      implied by "it's P2P"                             |
+    | dma_map_phys(dev, provider->base + off, len, attrs)    |
+    |   -> dma-debug: range registered by route_get, no warn |
+    |                                                        |
+    | ... hardware territory: queues tagged for TC3/VC3,     |
+    |     requests segmented per limits.boundary (256B) and  |
+    |     limits.update_granule (64B), completion counting   |
+    |     and data-before-flag release in the engine ...     |
+
+Policy semantics at [failure of route_get]:
+  REQUIRED   error out; no ordered consolation prize.
+  PREFERRED  re-derive the ordered plan from scratch. For CXL HDM
+             the plan legitimately changes address form to
+             host-mediated (THRU_HOST_BRIDGE): in-fabric *ordered*
+             P2P into HDM is not defined transport. Fallback is a
+             different transfer plan, never an attribute-stripped
+             copy of the UIO plan.
+  FORBIDDEN  pure ordered classification, route never attempted.
+
+End-to-end: what gets programmed where
+======================================
+
+Test topology (t2, the happy path; guest BDFs from the suite):
+
+                     pxb-cxl host bridge (bus 0c)
+                              |
+                  +-----------+-----------+
+                  |  cxl-rp rp0 0c:00.0   |  SVC3/4, flit
+                  +-----------+-----------+
+                              |                 <- link: flit
+                  +-----------+-----------+
+                  | cxl-upstream us0      |  SVC3/4, flit,
+                  | 0d:00.0               |  HDM dec cap UIO=1
+                  +--+-----------------+--+
+        (LCA: traffic turns here via HDM decoder match;
+         the rp0 link above is never traversed)
+           |                          |
+  +--------+---------+      +---------+--------+
+  | cxl-downstream   |      | cxl-downstream   |
+  | dsp0 0e:00.0     |      | dsp1 0e:01.0     |
+  | SVC3/4, flit,    |      | SVC3/4, flit,    |
+  | UIO-to-HDM gate  |      | UIO-to-HDM gate  |
+  +--------+---------+      +---------+--------+
+           |                          |
+  +--------+---------+      +---------+--------+
+  | cxl-type3 mem0   |      | cxl-type3 mem1   |
+  | 0f:00.0          |      | 10:00.0          |
+  | completer,hdm-db |      | requester, ATS   |
+  | region0 target   |      | (emits UIO)      |
+  +------------------+      +------------------+
+
+     UIO request flow:  mem1 -> dsp1 -> us0 -> dsp0 -> mem0
+     (decoder-matched at the switch, ACS explicitly bypassed,
+      contained by the per-DSP UIO-to-HDM gate instead)
+
+  device      register                   value   programmed by
+  ---------------------------------------------------------------
+  mem0        DevCap3.UIO_MEM_CPL        HwInit  (static)
+              DevCap3 14-bit Tag Cpl     HwInit  (MUST@FLIT; checked)
+              HDM dec cap UIO            HwInit  (static; count field
+                                                 reserved for devices)
+              HDM decoder0 ctrl UIO+ISP  set     region commit (ISP is
+                                                 programmed with the BI
+                                                 bit: it is BI-capable-
+                                                 device state for BISnp
+                                                 DPA->HPA, Table 8-123;
+                                                 UIO's 9.16.1.2 match
+                                                 reuses it)
+              SVC VC3: proto=UIO,TC3,EN  set     route commit
+              (both Link partners must enable the VC; TC3 mapping
+               lives in the Port containing the Completer Function)
+  us0         HDM switch decoder UIO     1       region commit
+              + UIG/UIW/ISP upstream             region commit
+                reverse-decode fields
+                (Table 8-123, 9.16.1.1)
+              SVC: capability verified; VCs untouched - the
+              in-fabric route never uses us0's upstream Link,
+              and VC enable is both-Link-partners state
+              (7.9.29.7/.8)
+  dsp0/dsp1   PortExt DVSEC ctl bit 4    1       route commit
+              (UIO-to-HDM, default 0 => CA;
+               RW in DSPs only - RsvdP in RPs,
+               Table 8-32)
+              SVC VC3: proto=UIO,TC3,EN  set     route commit
+  rp0         (not on the in-fabric path; SVC verified only if
+               a path traverses it)
+  mem1        SVC VC3: proto=UIO,TC3,EN  set     route commit
+              DevCtl3.UIO_REQ_EN         1       route commit
+              (first route sets, last route/revoke clears;
+               only meaningful with Bus Master Enable)
+
+VC ownership is per host bridge: under OS ownership (current
+default; no _OSC bit exists yet) route commit adopts SVC (one-way
+per boot via the Use VC/MFVC RW1C bit) and programs the UIO VC;
+under PLATFORM ownership the same call degrades to verify-only.
+VC state is touched only on ports whose Link the route actually
+traverses - enabling a VC whose Link partner is never configured
+leaves VC Negotiation Pending set forever.
+
+End-to-end: a request's journey through the programmed fabric
+=============================================================
+
+What the state above buys at transfer time - one UIO Memory Write
+from mem1 into region0 (HPA H inside [base, base+256M)):
+
+  mem1 engine        UIOMWr, 64b addr = H (AT=Translated), TC3
+      | emission gated by DevCtl3.UIO_REQ_EN && BME
+      v
+  dsp1 (ingress DSP, upstream direction)
+      | rides VC3 (SVC resource: protocol=UIO, TC3 mapped)
+      | UIO-to-HDM gate bit set, else -> Completer Abort
+      v
+  us0 switch USP decoder
+      | HDM decoder: UIO=1, range match on H,
+      | UIG/UIW decode position -> target list -> dsp0
+      | (forwarded to the peer DSP regardless of ACS -
+      |  containment is the DVSEC gate, not ACS)
+      v
+  dsp0 (egress DSP, downstream direction)
+      | VC3 again; UIO-to-HDM gate set
+      v
+  mem0 HDM decoder0 (UIO=1)   HPA H -> DPA, commit to media
+      |
+      v
+  UIOWrCpl(s) flow back mem0 -> ... -> mem1, any order, possibly
+  coalesced per Transaction ID (switches never coalesce); mem1
+  counts completed DWs against outstanding DWs for the shared ID
+  and only then releases the dependent flag/doorbell write.
+
+Two invariants the kernel negotiated into route->limits protect
+this walk: no request crosses a 256B boundary (further clamped to
+the interleave granularity - a straddling request is forwarded to
+the start-address owner and Completer Aborted), and visibility is
+all-or-nothing per naturally aligned 64B block.
+
+If any hop had been left unprogrammed, the TLP targeting an
+egress without a UIO-configured VC is dropped with TLP
+Translation Egress Blocked - which is exactly why validation is
+all-or-nothing *before* any enable is flipped, and why role state
+is exclusively route-owned.
+
+End-to-end: normal lifecycle (time axis)
+========================================
+
+  probe        cxl_pci/cxl_mem probe
+    |            cxl_bi_setup(): BI flows enabled on the path
+    |            cxl_hdm_uio_setup(): cxlds->uio latched from
+    |              DevCap3.CPL + HDM decoder cap UIO (static
+    |              target capability; nothing enabled, nothing
+    |              to tear down)
+    v
+  provision    region created, uio=1 (pre-commit), commit:
+    |            gates checked, decoders programmed (UIO bit,
+    |            UIG/UIW), region becomes a typed provider
+    v
+  acquire      pci_p2pdma_map_info() -> pci_uio_route_get():
+    |            path validated, gates + VC3 + requester enable
+    |            committed leaf-to-requester
+    v
+  map          dma_map_phys(..., DMA_ATTR_UIO [| MMIO for BAR])
+    |            dma-debug: covered by the route registration
+    v
+  transfer     hardware territory (diagram above)
+    |
+    v
+  teardown     1. driver blocks new submissions
+    |          2. requester drains outstanding UIO completions
+    |             (Group II rule: stop issuing on the shared ID
+    |             until DW accounting balances)
+    |          3. dma_unmap_phys() - the DMA core still never
+    |             fences; "stopped" was made precise by 2.
+    |          4. pci_uio_route_put() - final put drops
+    |             requester role, then routing/gates leaf-ward,
+    |             for roles no surviving route needs
+    |          5. region uncommit (echo 0 > commit) - provider
+    |             gone; any route still alive at this point is
+    |             force-revoked first (see below)
+    v          6. cxl_bi teardown on unbind (BI RFC contract)
+
+Fabric events (next section) enter this ladder at step 4 and
+*force* steps 1-3 through the route ops.
+
+End-to-end: revocation
+======================
+
+     device_del   FLR/reset      DPC/AER        region reset
+         |            |          recovery            |
+         v            v             |                v
+   pci_stop_dev  pci_dev_save_      |         cxl_region_decode_
+        |        and_disable        v         reset (per target)
+        |             |      pcie_do_recovery        |
+        +------+------+------ (whole subtree) -------+
+               |
+               v
+    pci_uio_route_revoke_dev()/_revoke_subtree()
+               |
+      for every route involving the device:
+        1. generation++, revoked = true
+           (pci_uio_route_valid() now false, hot-path cheap)
+        2. ops->quiesce(route)   stop submissions, drain UIO
+                                 completions, suppress dependent
+                                 doorbells of failed batches
+        3. drop roles, requester FIRST:
+             DevCtl3.UIO_REQ_EN clear      (refcounted)
+             SVC VC / UIO-to-HDM gates     (refcounted, only
+                                            when no surviving
+                                            route needs them)
+             dma-debug coverage unregistered
+        4. ops->revoke(route)    mappings must be treated dead
+        5. references drain via pci_uio_route_put()
+
+Ordering rationale: a requester left enabled past its routing emits
+TLPs the fabric cannot deliver; a completer-side gate dropped under
+live mappings produces completions nobody is counting.
+
+The FLR asymmetry from the spec is honored: SVC registers are
+FLR-exempt (fabric VC config survives), DevCtl3.UIO_REQ_EN is not
+(emission permission dies with the function and is only ever
+reinstated by a fresh route).
+
+Series organization
+===================
+
+Nine patches in three groups. Every patch builds standalone (the
+whole series was compile-checked commit by commit), and patches 1-6
+are pure PCIe/DMA with no CXL dependency - independently useful for
+NTB meshes and multi-link fabrics, and mergeable ahead of the CXL
+consumer.
+
+Group 1 - discovery and annotation (small, self-contained):
+
+  [1] PCI/UIO: capability discovery. Register definitions
+      (DevCap3/DevCtl3 UIO + 14-bit Tag bits, SVC 0x35), the
+      ATS-style parse, role predicates, debugfs. No behavior beyond
+      clearing leftover requester enables.
+  [2] dma-mapping: DMA_ATTR_UIO. One annotation bit plus three
+      dma-debug checks; no lowering changes.
+  [3] PCI/P2PDMA: typed providers. The provider grows
+      type/base/size/flags and the range_validate hook;
+      pci_p2pdma_map_info() classifies subranges worst-case across
+      an interleave target set. No behavior change for existing
+      providers or consumers.
+
+Group 2 - the route machinery. This was originally one 1400-line
+patch; it is split along its three seams so each piece carries one
+reviewable idea:
+
+  [4] PCI/UIO: route objects. The core state machine only:
+      validate-then-commit acquisition (path walk, endpoint
+      conformance, leaf-to-requester role commit with unwind),
+      negotiated limits, refcounted release, VC ownership. If you
+      review one patch closely, make it this one.
+  [5] PCI/UIO: revocation. The quiesce/revoke machinery and its
+      three entry points (removal, reset preparation, error
+      recovery). Depends on [4]'s object; adds no new concepts,
+      only lifetime enforcement.
+  [6] PCI/P2PDMA: UIO policy wiring. The consumer-facing
+      REQUIRED/PREFERRED/FORBIDDEN semantics on
+      pci_p2pdma_map_info(), attribute derivation
+      (p2pdma_map_attrs()), and BAR provider completer declaration.
+      Pure glue between [3] and [4]; contains the fallback policy
+      decisions worth debating separately from the route mechanics.
+
+Group 3 - CXL integration:
+
+  [7] cxl: target capability + region provisioning. cxlds->uio
+      latch, region uio/uio_policy attributes, the sec 9.16 commit
+      gates, and decoder UIO/UIG/UIW/ISP programming.
+  [8] cxl/region: the committed region as a typed P2PDMA provider
+      with interleave target-set decode.
+  [9] cxl: the debugfs test consumer driving everything above
+      (validation vehicle only).
+
+How to test
+===========
+
+No UIO hardware exists; everything below runs on QEMU emulation.
+The QEMU side is enumeration-only - there is no UIO data path - so
+the tests exercise discovery, provisioning gates, route validation
+and commit (including live SVC VC programming and config-space
+side effects), attribute derivation, policy fallback, and
+revocation. Wire behavior (completion accounting, 64B granule
+visibility) is not emulatable today.
+
+1. QEMU: qemu.git v11.0.0-rc0 + 16 patches, in order:
+   - 3x CXL BI decoder emulation fixes and 4x per-window CFMWS
+     restriction flags (adds -M cxl-fmw.N.back-invalidate=on),
+     prerequisites shared with the BI RFC [1]
+   - the 8-patch UIO enumeration RFC from Samsung [2], rebased
+     onto v11.0.0-rc0 with the on-list review fixes folded in:
+     the always-true component type check (Junjie Cao), the
+     PCI_EXP_FLAGS/LNKSTA2 flit typo corrupting the Interrupt
+     Message Number (Junjie Cao), SVC placed before AER and
+     clobbered on generic root ports (Junjie Cao), capability-
+     dependent HDM decoder write masks (Jonathan Cameron), the
+     x-uio-svc3/x-uio-svc4 property rename (agreed on-list), and
+     a cxl-upstream flitmode field mixup that left the USP
+     advertising UIO=0
+   - 1 testability patch: Device 3 extended capability emulation
+     (the posted series has nothing for DevCap3 role discovery
+     to read), x-uio-req and x-ats properties on cxl-type3, and
+     a guest-writable UIO-to-HDM Port DVSEC control bit
+   Branch: <QEMU-BRANCH-URL>          (uio-work-rfc)
+
+2. Guest kernel config on top of a CXL-enabled config:
+     CONFIG_PCI_P2PDMA=y  CONFIG_PCI_UIO=y  CONFIG_CXL_UIO_TEST=y
+     CONFIG_DMA_API_DEBUG=y (optional, for the coverage checks)
+     CONFIG_HOTPLUG_PCI_PCIE=y (required for the hot-remove test)
+
+3. Launch the happy-path topology (t2 above):
+
+  qemu-system-x86_64 -smp 4 -m 4G -machine q35,accel=kvm,cxl=on \
+    -object memory-backend-ram,id=m0,size=1G \
+    -object memory-backend-ram,id=m1,size=1G \
+    -device pxb-cxl,bus_nr=12,bus=pcie.0,id=cxl.1 \
+    -device cxl-rp,port=0,bus=cxl.1,id=rp0,chassis=0,slot=2,\
+x-uio-svc3=on,x-uio-svc4=on,x-256b-flit=on \
+    -device cxl-upstream,bus=rp0,id=us0,x-uio-svc3=on,\
+x-uio-svc4=on,x-256b-flit=on \
+    -device cxl-downstream,port=0,bus=us0,id=dsp0,chassis=0,\
+slot=4,x-uio-svc3=on,x-uio-svc4=on,x-256b-flit=on \
+    -device cxl-downstream,port=1,bus=us0,id=dsp1,chassis=0,\
+slot=5,x-uio-svc3=on,x-uio-svc4=on,x-256b-flit=on \
+    -device cxl-type3,bus=dsp0,volatile-memdev=m0,id=mem0,\
+x-256b-flit=on,hdm-db=on,x-uio=on,x-uio-req=on,x-ats=on \
+    -device cxl-type3,bus=dsp1,volatile-memdev=m1,id=mem1,\
+x-256b-flit=on,hdm-db=on,x-uio=on,x-uio-req=on,x-ats=on \
+    -M cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G,\
+cxl-fmw.0.interleave-granularity=4k,cxl-fmw.0.back-invalidate=on
+
+4. Discovery. In the guest:
+
+   # cat /sys/kernel/debug/pci_uio/capabilities
+   0000:0c:00.0: routing
+   0000:0d:00.0: routing
+   0000:0e:00.0: routing
+   0000:0e:01.0: routing
+   0000:0f:00.0: requester completer routing
+   0000:10:00.0: requester completer routing
+
+   (endpoints list 'routing' because they too carry SVC: TC/VC
+   mapping and VC enablement are per-Link, both-partners state)
+
+5. Provision a UIO region on mem0 (endpoint decoder names vary;
+   map memdev to endpoint via the port's uport symlink):
+
+   cd /sys/bus/cxl/devices
+   region=$(cat decoder0.0/create_ram_region)
+   echo $region > decoder0.0/create_ram_region
+   echo 256 > $region/interleave_granularity
+   echo 1 > $region/interleave_ways
+   echo $((256<<20)) > $region/size
+   echo ram > decoder3.0/mode
+   echo $((256<<20)) > decoder3.0/dpa_size
+   echo decoder3.0 > $region/target0
+   echo 1 > $region/uio          # pre-commit only
+   echo 1 > $region/commit
+   cat decoder3.0/uio            # -> 1
+
+   Commit is where the gates fire: HDM-DB only, Standard Modulo
+   window only, ways in {1,2,4,8,16}, every target BI+UIO capable,
+   and the endpoint uplink segment check (SVC + flit per hop) as a
+   requester-independent fail-fast; pci_uio_route_get() remains
+   the authoritative gate.
+
+6. Acquire a route and mapping with the test consumer (mem1 as
+   requester, mem0's region as target):
+
+   cd /sys/kernel/debug/cxl_uio_test
+   echo -n 0000:10:00.0 > requester
+   echo -n region0 > region
+   echo -n required > policy
+   echo 1 > acquire
+   cat acquire
+
+   Expected (values observed under the suite):
+     rc: 0
+     map_type: 3           PCI_P2PDMA_MAP_BUS_ADDR (in-fabric,
+                           peers emit HPAs, bus_offset 0)
+     xport_uio: 1
+     attrs: 0x4000         DMA_ATTR_UIO, no DMA_ATTR_MMIO
+     route_tc: 3           default UIO TC/VC assignment
+     route_vc: 3
+     route_flags: 0x1      PCI_UIO_ROUTE_IN_FABRIC
+     max_write_size: <path min MPS>
+     boundary: 256         256B rule, clamped to interleave gran
+     update_granule: 64    normative
+     nr_hops: 3            dsp1, us0, dsp0
+     nr_targets: 1
+
+   Config-space side effects, verifiable with setpci:
+     # setpci -s 10:00.0 ECAP002f+8.L    -> bit 7 set (REQ_EN)
+     # cat /sys/kernel/debug/pci_uio/routes
+     0000:10:00.0 -> region0 [0 +0x10000000] tc3 vc3 ... in-fabric
+   Release (echo 1 > release) and REQ_EN reads clear again -
+   requester emission permission tracks route lifetime exactly.
+
+7. Failure matrix - each knob flips one gate:
+
+   change                              expected
+   ----------------------------------------------------------
+   cxl-type3 without x-uio             region commit: EOPNOTSUPP
+                                       ("not a UIO Direct P2P
+                                       target" with dyndbg)
+   any port without x-uio-svc3         commit: EOPNOTSUPP
+                                       (segment check names hop)
+   cxl-upstream x-256b-flit=off        region rejected (the flit
+                                       gate; BI's own flit
+                                       prerequisite fires first)
+   2-way region across two RPs         commit: ENXIO (pxb host
+                                       bridge advertises no UIO
+                                       decoders; decoder count
+                                       gate fails closed)
+   policy=required on non-uio region   acquire rc: -95
+   policy=preferred on non-uio region  rc 0, xport_uio 0, ordered
+                                       host-mediated plan
+   policy=forbidden                    rc 0, map_type 4
+                                       (THRU_HOST_BRIDGE for HDM)
+   requester without x-ats             route_get: EOPNOTSUPP
+                                       (HDM decoders match
+                                       translated addresses only)
+
+8. Revocation:
+
+   a. Region teardown: with a route held, echo 0 > commit on the
+      region. cxl_uio_test's valid file flips 1 -> 0 and events
+      shows quiesce/revoke each fired exactly once.
+   b. Completer hot-remove: (qemu) device_del mem0. Orderly
+      pciehp removal revokes the route, fires the ops, and
+      clears the requester's DevCtl3 enable - while the fabric
+      SVC state of surviving ports is left alone.
+
+9. Automated suite: everything above is scripted (eight
+   topologies, TAP output) at [3]; ./run-all.sh boots each
+   variant, drives the guest over ssh, and collects results:
+
+     t1  direct attach (no switch)  RP-only target provisioning
+     t2  switch happy path          43 checks + 4 hot-remove
+     t5  device without UIO cap     commit gate
+     t4  port without SVC           segment check
+     t3  non-flit uplink            flit gate
+     t6  4-way interleave           per-endpoint ISP, subrange decode
+     t7  requester without ATS      translated-address gate
+     t8  cross root port            HB decoder gate + fallback
+
+Notes and open questions
+========================
+
+- DMA_ATTR_UIO is bit 14 (bits 10-13 grew occupants upstream).
+- DevCap3/DevCtl3 defines follow the tree's existing PCI_DEV3_*
+  namespace rather than PCI_EXP_DEVCAP3_*.
+- The 14-Bit Tag capability bits live in DevCap3 (bits 1/2, Table
+  7-109); UIO channel operation architects exactly one Tag size
+  (14-bit), and the Completer bit MUST@FLIT be Set - route
+  validation checks it on every target as a conformance screen.
+- No _OSC negotiation exists for SVC ownership yet; native_svc
+  defaults to OS-owned. The enum and verify-only PLATFORM path
+  are in place for when the bit lands.
+- XOR-interleaved (CXIMS) windows are rejected for UIO at
+  provisioning; QEMU has no CXIMS emulation, so that check is
+  covered by inspection only.
+- Bumping PCI_EXT_CAP_ID_MAX makes vfio config space
+  virtualization hide SVC from guests (zero length) instead of
+  passing it raw - arguably the right fail-closed default for a
+  host-owned VC resource, but flagging it.
+- Multipath (PCI_UIO_ROUTE_MULTIPATH), host-memory UIO, and the
+  large_uio/256B-boundary-disable path are reserved, not
+  implemented.
+- Suspend/resume is deferred: SVC registers and DevCtl3 are not in
+  the PCI save/restore set yet, so D3cold loses route hardware
+  state (the FLR exemption list does not cover cold transitions).
+- The endpoint-decoder ISP hunk (BISnp DPA->HPA, Table 8-123)
+  logically belongs in the Back-Invalidate series and will move
+  there on its next respin.
+
+This series applies on top of the CXL Back-Invalidate RFC [1]; see
+"Series organization" above for the patch-by-patch structure.
+
+[1] <BI-RFC-LORE-LINK>
+[2] https://lore.kernel.org/linux-cxl/20260609105836.3702787-1-shrihari.s@samsung.com/
+[3] <UIO-TESTS-URL>   (~/code/uio-tests)
+
+Davidlohr Bueso (9):
+  PCI/UIO: Add Unordered IO capability discovery
+  dma-mapping: Add DMA_ATTR_UIO annotation attribute
+  PCI/P2PDMA: Add typed providers and range-aware transfer
+    classification
+  PCI/UIO: Add UIO route objects
+  PCI/UIO: Revoke routes on removal, reset and error recovery
+  PCI/P2PDMA: Wire UIO policy into transfer plans
+  cxl: Add UIO Direct P2P target capability and region provisioning
+  cxl/region: Expose committed regions as typed P2PDMA providers
+  cxl: Add UIO route/mapping test consumer module
+
+ Documentation/ABI/testing/sysfs-bus-cxl   |   45 +
+ Documentation/core-api/dma-attributes.rst |   25 +
+ drivers/cxl/Kconfig                       |   11 +
+ drivers/cxl/Makefile                      |    3 +
+ drivers/cxl/core/hdm.c                    |   57 +
+ drivers/cxl/core/pci.c                    |  112 ++
+ drivers/cxl/core/port.c                   |   30 +
+ drivers/cxl/core/region.c                 |  324 ++++++
+ drivers/cxl/cxl.h                         |   17 +
+ drivers/cxl/cxlmem.h                      |    3 +
+ drivers/cxl/mem.c                         |    4 +
+ drivers/cxl/uio_test.c                    |  384 +++++++
+ drivers/pci/Kconfig                       |   15 +
+ drivers/pci/Makefile                      |    1 +
+ drivers/pci/p2pdma.c                      |  157 ++-
+ drivers/pci/pci.c                         |   11 +
+ drivers/pci/pci.h                         |   37 +
+ drivers/pci/pcie/err.c                    |    7 +
+ drivers/pci/probe.c                       |    4 +
+ drivers/pci/remove.c                      |    5 +
+ drivers/pci/uio.c                         | 1143 +++++++++++++++++++++
+ include/cxl/cxl.h                         |    2 +
+ include/linux/dma-map-ops.h               |   12 +
+ include/linux/dma-mapping.h               |   24 +
+ include/linux/pci-p2pdma.h                |  125 ++-
+ include/linux/pci-uio.h                   |  239 +++++
+ include/linux/pci.h                       |    8 +
+ include/uapi/linux/pci_regs.h             |   31 +-
+ kernel/dma/debug.c                        |  105 +-
+ 29 files changed, 2915 insertions(+), 26 deletions(-)
+
+--
+2.47.0
