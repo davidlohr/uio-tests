@@ -32,8 +32,7 @@ parts, which you build once and then point the harness at:
 | **QEMU** | a `qemu-system-x86_64` with the UIO enumeration series applied (SVC ext cap 0x35, flit-mode props, Device-3 capability, `cxl-type3` `x-uio`/`x-uio-req`/`x-ats`, per-window `back-invalidate` CFMWS, FLR on `cxl-type3`). |
 | **guest image** | any small Debian/Ubuntu qcow2 used purely as a **userland** — see below. |
 
-> Fill in your published branch URLs here when you clone this:
-> kernel `<KERNEL-SERIES-URL>`, QEMU `<QEMU-SERIES-URL>`. The QEMU side
+> kernel `https://github.com/davidlohr/linux/tree/pcie-uio-rfc`, QEMU `https://github.com/davidlohr/qemu/tree/uio-work-rfc`. The QEMU side
 > builds on the Samsung UIO enumeration RFC
 > (`20260609105836.3702787-1-shrihari.s@samsung.com` on linux-cxl).
 
