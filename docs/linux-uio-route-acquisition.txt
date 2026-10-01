@@ -1,0 +1,52 @@
+consumer             p2pdma             pci/uio.c                        cxl
+    |                   |                   |                             |
+    | provider = cxl_region_p2pdma_provider(region)                       |
+    |-------------------------------------------------------------------->|
+    | &cxlr->p2p_provider [CXL_HDM, UIO_COMPLETER]                        |
+    |<- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - |
+    |                   |                   |                             |
+    | pci_p2pdma_map_info(provider, dev, off, len,                        |
+    |                     req{policy=REQUIRED}, &info)                    |
+    |------------------>|                   |                             |
+    |                   | pci_uio_route_get(requester, provider,          |
+    |                   |                   off, len, req)                |
+    |                   |------------------>|                             |
+    |                   |                   | [1] caps (req + completer)  |
+    |                   |                   | [2] range_validate()        |
+    |                   |                   |---------------------------->|
+    |                   |                   | targets + interleave gran   |
+    |                   |                   |<- - - - - - - - - - - - - - |
+    |                   |                   | [3] per-target walk to LCA  |
+    |                   |                   | [4] commit leaf->requester  |
+    |                   |                   | [5] limits = path minimum   |
+    |                   | route (ref)       |                             |
+    |                   |<- - - - - - - - - |                             |
+    | info{type=BUS_ADDR, XPORT_UIO, uio_route}                           |
+    |<- - - - - - - - - |                   |                             |
+    |                   |                   |                             |
+    |--+ attrs = p2pdma_map_attrs(&info, provider)                        |
+    |<-+   -> DMA_ATTR_UIO, not DMA_ATTR_MMIO (HDM may be                 |
+    |         host-cacheable; MMIO is a BAR property)                     |
+    |--+ dma_map_phys(dev, provider->base + off, len, attrs)              |
+    |<-+   -> dma-debug: range registered by route_get, no warn           |
+    |                   |                   |                             |
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ hardware territory ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    queues tagged TC3/VC3; requests segmented per limits.boundary
+    (256B) and limits.update_granule (64B); completion counting and
+    data-before-flag release happen in the requester engine
+
+Enforcement points:
+
+  [1] capabilities: requester DevCap3.REQ, provider UIO_COMPLETER.
+  [2] range_validate(): cxl resolves the subrange to its interleave
+      target set and granularity.
+  [3] per-target walk up to the lowest common ancestor (LCA): flit
+      mode per link, SVC routing per hop, ACS-free path (BAR) or
+      ATS-capable requester (HDM).
+  [4] commit, leaf -> requester, unwinding in reverse on any failure:
+        a. target endpoint VCs
+        b. UIO-to-HDM DVSEC gate per DSP
+        c. SVC VC3 per hop
+        d. requester's own VC
+        e. DevCtl3.REQ_EN
+  [5] limits from the path minimum (MPS, update granule).
